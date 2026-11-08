@@ -108,7 +108,7 @@ struct SgIoHeader {
 }
 
 const _: () = assert!(size_of::<NvmeAdminCommand>() == 72);
-const _: () = assert!(size_of::<SgIoHeader>() == 88);
+const _: () = assert!(size_of::<SgIoHeader>() == if size_of::<usize>() == 8 { 88 } else { 64 });
 
 /// The health values a drive reported; a value it does not offer stays None.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

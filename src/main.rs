@@ -16,6 +16,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
+// 32-bit builds stay free of C code, so that they cross-compile with Rust's own linker
+#[cfg(target_pointer_width = "64")]
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

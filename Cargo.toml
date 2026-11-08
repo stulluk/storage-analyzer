@@ -6,11 +6,13 @@ description = "Browse disks, partitions and folders as a proportional box map in
 
 [dependencies]
 libc = "0.2"
-mimalloc = "0.1"
 ratatui = "0.30"
 rayon = "1"
 rustix = { version = "1", features = ["fs"] }
 unicode-width = "0.2"
+
+[target.'cfg(target_pointer_width = "64")'.dependencies]
+mimalloc = "0.1"
 
 [profile.release]
 codegen-units = 1

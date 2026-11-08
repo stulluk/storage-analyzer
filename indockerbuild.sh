@@ -1,6 +1,7 @@
 #!/bin/sh
 # Compile storage-analyzer inside the build container; the static binary lands in ./out on the host.
-# Usage: ./indockerbuild.sh [JOBS] [cargo args...]   (default: format check + tests + clippy + build)
+# Usage: [TARGET=triple] ./indockerbuild.sh [JOBS] [cargo args...]
+#        (default: format check + tests + clippy + build, for the host or for TARGET)
 set -eu
 
 IMAGE="storage-analyzer-build"
@@ -14,10 +15,13 @@ LOG="${TOP}/logs/indockerbuild_$(date +%Y%m%d_%H%M%S).log"
 if [ $# -gt 0 ]; then
   CMD="cargo $*"
 else
-  CMD="cargo fmt --check && cargo test --release -j ${JOBS} \
-    && cargo clippy --release --all-targets -j ${JOBS} -- -D warnings \
-    && cargo build --release -j ${JOBS} \
-    && cp target/release/storage-analyzer out/storage-analyzer.new \
+  TARGET="${TARGET:-}"
+  TARGET_FLAG="${TARGET:+--target ${TARGET}}"
+  BUILT="target/${TARGET:+${TARGET}/}release/storage-analyzer"
+  CMD="cargo fmt --check && cargo test --release ${TARGET_FLAG} -j ${JOBS} \
+    && cargo clippy --release --all-targets ${TARGET_FLAG} -j ${JOBS} -- -D warnings \
+    && cargo build --release ${TARGET_FLAG} -j ${JOBS} \
+    && cp ${BUILT} out/storage-analyzer.new \
     && mv -f out/storage-analyzer.new out/storage-analyzer"
 fi
 

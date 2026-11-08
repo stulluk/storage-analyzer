@@ -122,12 +122,20 @@ gdu 5.36.1, on a tree of 21.3 million files and 4.8 million folders:
 
 ## Installation
 
-Download the static Linux x86_64 binary from the latest release:
+Download the static binary for your machine from the latest release:
+
+| Machine | File |
+| --- | --- |
+| x86_64 | `storage-analyzer-x86_64-linux-musl` |
+| 64-bit ARM | `storage-analyzer-aarch64-linux-musl` |
+| 32-bit ARM (ARMv7, hard float) | `storage-analyzer-armv7-linux-musleabihf` |
 
 ```bash
-curl -L -o storage-analyzer https://github.com/stulluk/storage-analyzer/releases/latest/download/storage-analyzer-x86_64-linux-musl
+curl -L -o storage-analyzer https://github.com/stulluk/storage-analyzer/releases/latest/download/storage-analyzer-aarch64-linux-musl
 chmod +x storage-analyzer
 ```
+
+A 32-bit build can address at most about 3 GB, which limits it to trees of roughly 30 million files.
 
 Every push to `main` is tested and rebuilds the release of the version in `Cargo.toml`.
 
@@ -162,6 +170,7 @@ The toolchain stays inside Docker. Build the image once, then format, test, lint
 ./dockerbuild.sh
 ./indockerbuild.sh 25 fmt
 ./indockerbuild.sh
+TARGET=armv7-unknown-linux-musleabihf ./indockerbuild.sh
 ```
 
 The static binary is written to `out/storage-analyzer`.

@@ -8,8 +8,20 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-24.04
+  build:
+    strategy:
+      matrix:
+        include:
+          - name: x86_64-linux-musl
+            runner: ubuntu-24.04
+            target: ""
+          - name: aarch64-linux-musl
+            runner: ubuntu-24.04-arm
+            target: ""
+          - name: armv7-linux-musleabihf
+            runner: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -17,23 +29,46 @@ jobs:
         run: ./dockerbuild.sh
 
       - name: Test, lint and build the static binary
+        env:
+          TARGET: ${{ matrix.target }}
         run: ./indockerbuild.sh
 
       - name: Check the binary
         run: |
           file out/storage-analyzer | grep -q 'static'
-          ./out/storage-analyzer --version
+          if [ -z "${{ matrix.target }}" ]; then ./out/storage-analyzer --version; fi
+
+      - name: Name the binary
+        run: |
+          mkdir release
+          cp out/storage-analyzer "release/storage-analyzer-${{ matrix.name }}"
+          cd release
+          sha256sum "storage-analyzer-${{ matrix.name }}" > "storage-analyzer-${{ matrix.name }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          asset="storage-analyzer-x86_64-linux-musl"
-          cp out/storage-analyzer "$asset"
-          sha256sum "$asset" > "$asset.sha256"
           gh release delete "$version" --cleanup-tag --yes || true
-          gh release create "$version" "$asset" "$asset.sha256" \
+          gh release create "$version" release/* \
             --target "$GITHUB_SHA" \
             --title "$version" \
-            --notes "Static Linux x86_64 binary built from $GITHUB_SHA."
+            --notes "Static Linux binaries for x86_64, arm64 and armv7, built from $GITHUB_SHA."
