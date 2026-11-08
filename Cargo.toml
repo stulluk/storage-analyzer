@@ -1,0 +1,18 @@
+[package]
+name = "storage-analyzer"
+version = "0.1.0"
+edition = "2024"
+description = "Browse disks, partitions and folders as a proportional box map in the terminal"
+
+[dependencies]
+mimalloc = "0.1"
+ratatui = "0.30"
+rayon = "1"
+rustix = { version = "1", features = ["fs"] }
+serde_json = "1"
+unicode-width = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
