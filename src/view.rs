@@ -2,17 +2,19 @@
 
 use crate::disks::{Disk, Region, SWAP_MOUNT, UNALLOCATED};
 use crate::layout::{Rect, fit_treemap, layout_disks, stack_regions};
+use crate::smart::{Level, fit_fields, health_fields};
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier, Style};
+use std::collections::HashSet;
 use unicode_width::UnicodeWidthChar;
 
 const GIB: f64 = (1_u64 << 30) as f64;
 const FILL_CHAR: char = '#';
 const EMPTY_CHAR: char = '.';
 
-const DISK_HEADER_ROWS: usize = 2;
+const DISK_HEADER_ROWS: usize = 3;
 const MIN_DISK_WIDTH: usize = 34;
-const MIN_DISK_HEIGHT: usize = 7;
+const MIN_DISK_HEIGHT: usize = 8;
 const MIN_REGION_WIDTH: usize = 18;
 const MIN_MOUNTED_HEIGHT: usize = 4;
 const MIN_UNMOUNTED_HEIGHT: usize = 3;
@@ -26,6 +28,35 @@ const BORDER_RIGHT: u8 = 8;
 const BORDER_CHARS: [char; 16] = [
   ' ', '│', '│', '│', '─', '┘', '┐', '┤', '─', '└', '┌', '├', '─', '┴', '┬', '┼',
 ];
+
+const USED_LOW: Color = Color::Rgb(0x97, 0xC4, 0x59);
+const USED_HIGH: Color = Color::Rgb(0xEF, 0x9F, 0x27);
+const USED_FULL: Color = Color::Rgb(0xE2, 0x4B, 0x4A);
+const USED_HIGH_FROM: f64 = 0.70;
+const USED_FULL_FROM: f64 = 0.90;
+const FREE_SPACE: Color = Color::Rgb(0x2C, 0x2C, 0x2A);
+const TEXT_ON_USED: Color = Color::Rgb(0x17, 0x17, 0x16);
+const TEXT_ON_DARK: Color = Color::Rgb(0xE8, 0xE6, 0xDF);
+const TEXT_MUTED: Color = Color::Rgb(0xB4, 0xB2, 0xA9);
+const FOLDER_SMALL: (u8, u8, u8) = (0x16, 0x2C, 0x45);
+const FOLDER_LARGE: (u8, u8, u8) = (0x18, 0x5F, 0xA5);
+const FILE_SMALL: (u8, u8, u8) = (0x26, 0x26, 0x24);
+const FILE_LARGE: (u8, u8, u8) = (0x5F, 0x5E, 0x5A);
+const GROUP_TINT: Color = Color::Rgb(0x1F, 0x1F, 0x1E);
+const MARKED_TINT: Color = Color::Rgb(0x2E, 0x7D, 0x32);
+const SELECTION_FRAME: Color = Color::Rgb(0xFF, 0x1E, 0x1E);
+const DIALOG_BACKGROUND: Color = Color::Rgb(0x17, 0x17, 0x16);
+/// Partial block characters, indexed by the eighths of a cell they cover.
+const EIGHTHS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+
+/// How the inside of a box is painted.
+#[derive(Clone, Copy, Debug)]
+enum Fill {
+  Empty,
+  Hashes(f64),
+  Bar(f64),
+  Tint(Color),
+}
 
 /// Key of the box that merges the smallest items.
 pub const GROUP_KEY: &str = "";
@@ -104,6 +135,8 @@ pub fn fit_text(text: &str, width: usize) -> String {
 pub struct Canvas {
   pub width: usize,
   pub height: usize,
+  /// Draw with hashes and basic colours instead of solid colour fills.
+  ascii: bool,
   cells: Vec<char>,
   borders: Vec<u8>,
   styles: Vec<Style>,
@@ -111,11 +144,12 @@ pub struct Canvas {
 
 impl Canvas {
   /// Create an empty canvas.
-  pub fn new(width: usize, height: usize) -> Self {
+  pub fn new(width: usize, height: usize, ascii: bool) -> Self {
     let count = width * height;
     Self {
       width,
       height,
+      ascii,
       cells: vec![' '; count],
       borders: vec![0; count],
       styles: vec![Style::default(); count],
@@ -165,15 +199,52 @@ impl Canvas {
 
   /// Mark a box as selected, keeping its text.
   pub fn highlight(&mut self, rect: Rect) {
-    let border = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    if rect.width == 0 || rect.height == 0 {
+      return;
+    }
+    let right = rect.x + rect.width - 1;
+    let bottom = rect.y + rect.height - 1;
     let inside = Style::new().fg(Color::Black).bg(Color::Yellow);
+    let edge_color = if self.ascii {
+      Color::LightRed
+    } else {
+      SELECTION_FRAME
+    };
+    let edge = Style::new().fg(edge_color).add_modifier(Modifier::BOLD);
+    for y in rect.y..=bottom.min(self.height.saturating_sub(1)) {
+      for x in rect.x..=right.min(self.width.saturating_sub(1)) {
+        let index = y * self.width + x;
+        let glyph = match (x == rect.x, x == right, y == rect.y, y == bottom) {
+          (true, _, true, _) => '┏',
+          (_, true, true, _) => '┓',
+          (true, _, _, true) => '┗',
+          (_, true, _, true) => '┛',
+          (_, _, true, _) | (_, _, _, true) => '━',
+          (true, _, _, _) | (_, true, _, _) => '┃',
+          _ => {
+            if self.ascii {
+              self.styles[index] = inside;
+            }
+            continue;
+          }
+        };
+        self.styles[index] = edge;
+        if !self.ascii {
+          self.borders[index] = 0;
+          self.cells[index] = glyph;
+        }
+      }
+    }
+  }
+
+  /// Blank an area, including any borders crossing it.
+  fn clear(&mut self, rect: Rect, style: Style) {
     for y in rect.y..(rect.y + rect.height).min(self.height) {
       for x in rect.x..(rect.x + rect.width).min(self.width) {
-        let edge = y == rect.y
-          || x == rect.x
-          || y + 1 == rect.y + rect.height
-          || x + 1 == rect.x + rect.width;
-        self.styles[y * self.width + x] = if edge { border } else { inside };
+        let index = y * self.width + x;
+        self.cells[index] = ' ';
+        self.borders[index] = 0;
+        self.styles[index] = style;
       }
     }
   }
@@ -261,13 +332,84 @@ fn label_lines(
   vec![title.to_string(), detail]
 }
 
-/// Draw a box with its label and, when share is known, a proportional fill.
+/// Return the bar colour for a used share.
+fn usage_color(share: f64) -> Color {
+  if share >= USED_FULL_FROM {
+    USED_FULL
+  } else if share >= USED_HIGH_FROM {
+    USED_HIGH
+  } else {
+    USED_LOW
+  }
+}
+
+/// Return a colour between two others.
+fn mix(low: (u8, u8, u8), high: (u8, u8, u8), amount: f64) -> Color {
+  let channel = |from: u8, to: u8| (from as f64 + (to as f64 - from as f64) * amount).round() as u8;
+  Color::Rgb(
+    channel(low.0, high.0),
+    channel(low.1, high.1),
+    channel(low.2, high.2),
+  )
+}
+
+/// Return the columns fully used by a bar and the eighths used of the next column.
+fn bar_extent(width: usize, share: f64) -> (usize, usize) {
+  let eighths = ((width * 8) as f64 * share.clamp(0.0, 1.0)).round() as usize;
+  (eighths / 8, eighths % 8)
+}
+
+/// Paint a usage bar over a whole area, with a partial block at its end.
+fn paint_bar(
+  canvas: &mut Canvas,
+  (x, y): (usize, usize),
+  (width, height): (usize, usize),
+  share: f64,
+) {
+  let color = usage_color(share);
+  let (full, edge) = bar_extent(width, share);
+  for row in y..y + height {
+    canvas.put(x, row, &" ".repeat(full), Style::new().bg(color));
+    canvas.put(
+      x + full,
+      row,
+      &" ".repeat(width - full),
+      Style::new().bg(FREE_SPACE),
+    );
+    if edge > 0 {
+      let glyph = EIGHTHS[edge].to_string();
+      canvas.put(x + full, row, &glyph, Style::new().fg(color).bg(FREE_SPACE));
+    }
+  }
+}
+
+/// Write a label over a bar, with a text colour that suits each cell's background.
+fn put_on_bar(canvas: &mut Canvas, (x, y): (usize, usize), text: &str, bar: (usize, usize, f64)) {
+  let (bar_x, width, share) = bar;
+  let color = usage_color(share);
+  let (full, _) = bar_extent(width, share);
+  for (offset, c) in text.chars().enumerate() {
+    let column = x + offset;
+    let style = if column < bar_x + full {
+      Style::new().fg(TEXT_ON_USED).bg(color)
+    } else {
+      Style::new().fg(TEXT_ON_DARK).bg(FREE_SPACE)
+    };
+    canvas.put(
+      column,
+      y,
+      &c.to_string(),
+      style.add_modifier(Modifier::BOLD),
+    );
+  }
+}
+
+/// Draw a box with its label and its fill.
 fn draw_labelled(
   canvas: &mut Canvas,
   rect: Rect,
   (title, detail, short_detail): (&str, &str, Option<String>),
-  share: Option<f64>,
-  keep_fill_row: bool,
+  fill: Fill,
   style: Style,
 ) {
   canvas.draw_box(rect);
@@ -283,25 +425,35 @@ fn draw_labelled(
     short_detail,
     text_width,
     inner_height,
-    keep_fill_row,
+    matches!(fill, Fill::Hashes(_)),
   );
-  for (index, line) in lines.iter().enumerate() {
-    canvas.put(
-      rect.x + 2,
-      rect.y + 1 + index,
-      &fit_text(line, text_width),
-      style,
-    );
+  let (left, top) = (rect.x + 1, rect.y + 1);
+  match fill {
+    Fill::Bar(share) => paint_bar(canvas, (left, top), (inner_width, inner_height), share),
+    Fill::Tint(color) => {
+      for row in top..top + inner_height {
+        canvas.put(left, row, &" ".repeat(inner_width), Style::new().bg(color));
+      }
+    }
+    Fill::Empty | Fill::Hashes(_) => {}
   }
-  let Some(share) = share else {
-    return;
-  };
-  let filled = ((inner_width as f64 * share).round() as usize).min(inner_width);
-  let fill: String = std::iter::repeat_n(FILL_CHAR, filled)
-    .chain(std::iter::repeat_n(EMPTY_CHAR, inner_width - filled))
-    .collect();
-  for row in lines.len()..inner_height {
-    canvas.put(rect.x + 1, rect.y + 1 + row, &fill, Style::default());
+  for (index, line) in lines.iter().take(inner_height).enumerate() {
+    let line = fit_text(line, text_width);
+    let position = (left + 1, top + index);
+    match fill {
+      Fill::Bar(share) => put_on_bar(canvas, position, &line, (left, inner_width, share)),
+      Fill::Tint(color) => canvas.put(position.0, position.1, &line, style.bg(color)),
+      Fill::Empty | Fill::Hashes(_) => canvas.put(position.0, position.1, &line, style),
+    }
+  }
+  if let Fill::Hashes(share) = fill {
+    let filled = ((inner_width as f64 * share).round() as usize).min(inner_width);
+    let row: String = std::iter::repeat_n(FILL_CHAR, filled)
+      .chain(std::iter::repeat_n(EMPTY_CHAR, inner_width - filled))
+      .collect();
+    for index in lines.len()..inner_height {
+      canvas.put(left, top + index, &row, Style::default());
+    }
   }
 }
 
@@ -309,15 +461,34 @@ fn draw_labelled(
 fn draw_region(canvas: &mut Canvas, region: &Region, rect: Rect) {
   let (title, detail) = region_text(region);
   let short = region.percent().map(|percent| format!("{percent:.1}%"));
-  let share = region.percent().map(|percent| percent / 100.0);
+  let fill = match region.percent() {
+    Some(percent) if canvas.ascii => Fill::Hashes(percent / 100.0),
+    Some(percent) => Fill::Bar(percent / 100.0),
+    None => Fill::Empty,
+  };
   draw_labelled(
     canvas,
     rect,
     (&title, &detail, short),
-    share,
-    true,
+    fill,
     Style::default(),
   );
+}
+
+/// Write the health values of a disk on one row, coloured by how much attention they need.
+fn draw_health(canvas: &mut Canvas, disk: &Disk, (x, y): (usize, usize), width: usize) {
+  let mut column = x;
+  for field in fit_fields(health_fields(&disk.health), width) {
+    let style = match field.level {
+      Level::Muted => Style::new().fg(Color::DarkGray),
+      Level::Normal => Style::default(),
+      Level::Warning => Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+      Level::Alarm => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+    };
+    let text = fit_text(&field.text, width);
+    canvas.put(column, y, &text, style);
+    column += text.chars().count() + 2;
+  }
 }
 
 /// Draw a disk box with its details and regions, collecting the regions that can be opened.
@@ -336,6 +507,14 @@ fn draw_disk(canvas: &mut Canvas, disk: &Disk, rect: Rect, targets: &mut Vec<Tar
         title_style,
       );
     }
+  }
+  if DISK_HEADER_ROWS + 1 < rect.height {
+    draw_health(
+      canvas,
+      disk,
+      (rect.x + 2, rect.y + DISK_HEADER_ROWS),
+      text_width,
+    );
   }
   let header_rows = DISK_HEADER_ROWS + 1;
   if rect.height <= header_rows + 1 {
@@ -387,32 +566,74 @@ pub fn draw_disks(canvas: &mut Canvas, disks: &[Disk], area: Rect) -> Vec<Target
   targets
 }
 
+/// Return the title, fill and text style of one treemap box.
+fn entry_paint(entry: &Entry, share: f64, ascii: bool, marked: bool) -> (String, Fill, Style) {
+  if marked {
+    let dir_suffix = if matches!(entry.kind, EntryKind::Dir(_)) {
+      "/"
+    } else {
+      ""
+    };
+    let title = format!("{}{dir_suffix}", entry.name);
+    return if ascii {
+      (
+        title,
+        Fill::Hashes(share),
+        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+      )
+    } else {
+      (
+        title,
+        Fill::Tint(MARKED_TINT),
+        Style::new().fg(TEXT_ON_DARK).add_modifier(Modifier::BOLD),
+      )
+    };
+  }
+  let bold = Modifier::BOLD;
+  let strength = share.clamp(0.0, 1.0).sqrt();
+  let hashes = Fill::Hashes(share);
+  match entry.kind {
+    EntryKind::Dir(_) if ascii => (
+      format!("{}/", entry.name),
+      hashes,
+      Style::new().fg(Color::Cyan).add_modifier(bold),
+    ),
+    EntryKind::Dir(_) => (
+      format!("{}/", entry.name),
+      Fill::Tint(mix(FOLDER_SMALL, FOLDER_LARGE, strength)),
+      Style::new().fg(TEXT_ON_DARK).add_modifier(bold),
+    ),
+    EntryKind::File if ascii => (entry.name.clone(), hashes, Style::default()),
+    EntryKind::File => (
+      entry.name.clone(),
+      Fill::Tint(mix(FILE_SMALL, FILE_LARGE, strength)),
+      Style::new().fg(TEXT_ON_DARK),
+    ),
+    EntryKind::Group(count) if ascii => (
+      format!("({count} more)"),
+      hashes,
+      Style::new().fg(Color::DarkGray),
+    ),
+    EntryKind::Group(count) => (
+      format!("({count} more)"),
+      Fill::Tint(GROUP_TINT),
+      Style::new().fg(TEXT_MUTED),
+    ),
+  }
+}
+
 /// Draw one treemap box and return its selection target.
-fn draw_entry(canvas: &mut Canvas, entry: &Entry, rect: Rect, total: u64) -> Target {
+fn draw_entry(canvas: &mut Canvas, entry: &Entry, rect: Rect, total: u64, marked: bool) -> Target {
   let share = entry.size as f64 / total.max(1) as f64;
   let percent = format!("{:.1}%", share * 100.0);
   let detail = format!("{}  {percent}", format_size(entry.size));
-  let (title, style, key) = match entry.kind {
-    EntryKind::Dir(_) => (
-      format!("{}/", entry.name),
-      Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-      entry.name.clone(),
-    ),
-    EntryKind::File => (entry.name.clone(), Style::default(), entry.name.clone()),
-    EntryKind::Group(count) => (
-      format!("({count} more)"),
-      Style::new().fg(Color::DarkGray),
-      GROUP_KEY.to_string(),
-    ),
+  let (title, fill, style) = entry_paint(entry, share, canvas.ascii, marked);
+  let key = if matches!(entry.kind, EntryKind::Group(_)) {
+    GROUP_KEY.to_string()
+  } else {
+    entry.name.clone()
   };
-  draw_labelled(
-    canvas,
-    rect,
-    (&title, &detail, Some(percent)),
-    Some(share),
-    false,
-    style,
-  );
+  draw_labelled(canvas, rect, (&title, &detail, Some(percent)), fill, style);
   Target { key, rect }
 }
 
@@ -424,6 +645,7 @@ pub fn draw_folder(
   entries: &[Entry],
   total: u64,
   area: Rect,
+  marked: &HashSet<String>,
 ) -> (Vec<Target>, Option<Entry>) {
   let (groups, named): (Vec<&Entry>, Vec<&Entry>) = entries
     .iter()
@@ -442,7 +664,7 @@ pub fn draw_folder(
     .iter()
     .zip(&boxes)
     .take(kept)
-    .map(|(entry, &rect)| draw_entry(canvas, entry, rect, total))
+    .map(|(entry, &rect)| draw_entry(canvas, entry, rect, total, marked.contains(&entry.name)))
     .collect();
   let merged = boxes.get(kept).map(|&rect| {
     let count = (named.len() - kept) as u64 + groups.iter().map(group_count).sum::<u64>();
@@ -452,15 +674,57 @@ pub fn draw_folder(
       size,
       kind: EntryKind::Group(count),
     };
-    targets.push(draw_entry(canvas, &entry, rect, total));
+    targets.push(draw_entry(canvas, &entry, rect, total, false));
     entry
   });
   (targets, merged)
 }
 
+/// Draw a centred window with one row of text per line.
+pub fn draw_dialog(canvas: &mut Canvas, lines: &[String], danger: bool) {
+  let widest = lines
+    .iter()
+    .map(|line| line.chars().count())
+    .max()
+    .unwrap_or(0);
+  let width = (widest + 4).min(canvas.width);
+  let height = (lines.len() + 2).min(canvas.height);
+  if width == 0 || height == 0 {
+    return;
+  }
+  let rect = Rect {
+    x: (canvas.width - width) / 2,
+    y: (canvas.height - height) / 2,
+    width,
+    height,
+  };
+  let text = Style::new()
+    .fg(TEXT_ON_DARK)
+    .bg(DIALOG_BACKGROUND)
+    .add_modifier(Modifier::BOLD);
+  canvas.clear(rect, text);
+  canvas.draw_box(rect);
+  if danger {
+    let frame = text.fg(SELECTION_FRAME);
+    for x in rect.x..rect.x + rect.width {
+      canvas.styles[rect.y * canvas.width + x] = frame;
+      canvas.styles[(rect.y + rect.height - 1) * canvas.width + x] = frame;
+    }
+    for y in rect.y..rect.y + rect.height {
+      canvas.styles[y * canvas.width + rect.x] = frame;
+      canvas.styles[y * canvas.width + rect.x + rect.width - 1] = frame;
+    }
+  }
+  for (index, line) in lines.iter().take(height.saturating_sub(2)).enumerate() {
+    let fitted = fit_text(line, width.saturating_sub(4));
+    canvas.put(rect.x + 2, rect.y + 1 + index, &fitted, text);
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::smart::{Health, Report};
 
   const GIB: u64 = 1 << 30;
 
@@ -480,6 +744,7 @@ mod tests {
       model: "Model".to_string(),
       bus: "NVMe".to_string(),
       link: "PCIe Gen4 x4".to_string(),
+      health: Health::Reading,
       regions: vec![
         mounted("p1", "/media/a/very/long/mount/point", gib * GIB / 2),
         Region {
@@ -534,7 +799,7 @@ mod tests {
 
   #[test]
   fn canvas_joins_shared_borders() {
-    let mut canvas = Canvas::new(5, 3);
+    let mut canvas = Canvas::new(5, 3, false);
     canvas.draw_box(Rect {
       x: 0,
       y: 0,
@@ -552,7 +817,7 @@ mod tests {
 
   #[test]
   fn hostile_file_names_cannot_escape_their_cells() {
-    let mut canvas = Canvas::new(6, 1);
+    let mut canvas = Canvas::new(6, 1, false);
     canvas.put(0, 0, "a\x1b[\n界", Style::default());
     assert_eq!(canvas.text(), "a?[?? ");
   }
@@ -568,7 +833,7 @@ mod tests {
 
   #[test]
   fn fill_matches_the_share_of_the_folder() {
-    let mut canvas = Canvas::new(42, 8);
+    let mut canvas = Canvas::new(42, 8, true);
     let entry = Entry {
       name: "x".to_string(),
       size: 25,
@@ -584,15 +849,145 @@ mod tests {
         height: 8,
       },
       100,
+      false,
     );
     let row: String = canvas.text().lines().nth(3).unwrap().to_string();
     assert_eq!(row.matches(FILL_CHAR).count(), 10);
     assert_eq!(row.matches(EMPTY_CHAR).count(), 30);
   }
 
+  /// Return the background of one cell.
+  fn background(canvas: &Canvas, x: usize, y: usize) -> Option<Color> {
+    canvas.styles[y * canvas.width + x].bg
+  }
+
+  #[test]
+  fn bar_is_painted_up_to_the_used_share_with_a_partial_edge() {
+    let mut canvas = Canvas::new(22, 6, false);
+    let region = Region {
+      mountpoint: Some("/x".to_string()),
+      total: Some(1000),
+      used: Some(425),
+      ..Region::default()
+    };
+    let rect = Rect {
+      x: 0,
+      y: 0,
+      width: 22,
+      height: 6,
+    };
+    draw_region(&mut canvas, &region, rect);
+    assert_eq!(background(&canvas, 8, 3), Some(USED_LOW));
+    assert_eq!(background(&canvas, 9, 3), Some(FREE_SPACE));
+    assert_eq!(background(&canvas, 20, 3), Some(FREE_SPACE));
+    assert_eq!(canvas.shown(3 * 22 + 9), EIGHTHS[4]);
+    assert_eq!(canvas.shown(22 + 2), '/');
+  }
+
+  #[test]
+  fn bar_colour_follows_how_full_a_filesystem_is() {
+    assert_eq!(usage_color(0.34), USED_LOW);
+    assert_eq!(usage_color(0.843), USED_HIGH);
+    assert_eq!(usage_color(0.95), USED_FULL);
+  }
+
+  #[test]
+  fn folder_boxes_are_tinted_darker_when_larger() {
+    let entry = |size| Entry {
+      name: "x".to_string(),
+      size,
+      kind: EntryKind::Dir(1),
+    };
+    let brightness = |size| match entry_paint(&entry(size), size as f64 / 100.0, false, false).1 {
+      Fill::Tint(Color::Rgb(_, _, blue)) => blue,
+      other => panic!("unexpected fill {other:?}"),
+    };
+    assert!(brightness(90) > brightness(4));
+  }
+
+  #[test]
+  fn selection_is_a_heavy_frame_that_keeps_the_box_paint() {
+    let mut canvas = Canvas::new(6, 4, false);
+    let rect = Rect {
+      x: 0,
+      y: 0,
+      width: 6,
+      height: 4,
+    };
+    canvas.draw_box(rect);
+    canvas.put(1, 1, "    ", Style::new().bg(USED_LOW));
+    canvas.highlight(rect);
+    assert_eq!(canvas.text().lines().next(), Some("┏━━━━┓"));
+    assert_eq!(background(&canvas, 2, 1), Some(USED_LOW));
+  }
+
+  #[test]
+  fn health_row_is_written_under_the_link_row() {
+    let mut canvas = Canvas::new(60, 12, false);
+    let mut fixture = disk("a", 1000);
+    fixture.health = Health::Report(Report {
+      wear_percent: Some(12),
+      media_errors: Some(0),
+      ..Report::default()
+    });
+    let area = Rect {
+      x: 0,
+      y: 0,
+      width: 60,
+      height: 12,
+    };
+    draw_disks(&mut canvas, &[fixture], area);
+    assert!(
+      canvas
+        .text()
+        .lines()
+        .nth(3)
+        .unwrap()
+        .contains("Wear 12%  Errors 0")
+    );
+  }
+
+  #[test]
+  fn marked_boxes_are_green_and_selection_is_red() {
+    let mut canvas = Canvas::new(40, 8, false);
+    let list = entries(1);
+    let marked = HashSet::from(["item-0".to_string()]);
+    let area = Rect {
+      x: 0,
+      y: 0,
+      width: 40,
+      height: 8,
+    };
+    let (targets, _) = draw_folder(&mut canvas, &list, 1 << 20, area, &marked);
+    assert_eq!(background(&canvas, 5, 4), Some(MARKED_TINT));
+    canvas.highlight(targets[0].rect);
+    assert_eq!(canvas.styles[0].fg, Some(SELECTION_FRAME));
+  }
+
+  #[test]
+  fn dialog_covers_what_is_under_it_at_any_size() {
+    for (width, height) in [(0, 0), (1, 1), (6, 3), (30, 9), (80, 24)] {
+      let mut canvas = Canvas::new(width, height, false);
+      canvas.draw_box(Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+      });
+      let lines = [
+        "Delete this very long named thing?".to_string(),
+        "no".to_string(),
+      ];
+      draw_dialog(&mut canvas, &lines, true);
+    }
+    let mut canvas = Canvas::new(30, 9, false);
+    draw_dialog(&mut canvas, &["hello".to_string()], false);
+    assert!(canvas.text().contains("hello"));
+  }
+
   #[test]
   fn only_mounted_regions_can_be_opened() {
-    let mut canvas = Canvas::new(120, 30);
+    let mut canvas = Canvas::new(120, 30, false);
     let area = Rect {
       x: 0,
       y: 0,
@@ -606,7 +1001,7 @@ mod tests {
 
   #[test]
   fn merged_box_holds_everything_that_did_not_fit() {
-    let mut canvas = Canvas::new(40, 12);
+    let mut canvas = Canvas::new(40, 12, false);
     let list = entries(500);
     let total: u64 = list.iter().map(|entry| entry.size).sum();
     let area = Rect {
@@ -615,7 +1010,7 @@ mod tests {
       width: 40,
       height: 12,
     };
-    let (targets, merged) = draw_folder(&mut canvas, &list, total, area);
+    let (targets, merged) = draw_folder(&mut canvas, &list, total, area, &HashSet::new());
     let merged = merged.unwrap();
     assert_eq!(targets.last().unwrap().key, GROUP_KEY);
     let EntryKind::Group(count) = merged.kind else {
@@ -643,10 +1038,18 @@ mod tests {
         width,
         height,
       };
-      let mut canvas = Canvas::new(width, height);
-      draw_disks(&mut canvas, &disks, area);
-      let mut canvas = Canvas::new(width, height);
-      draw_folder(&mut canvas, &entries(300), 1 << 40, area);
+      for ascii in [false, true] {
+        let mut canvas = Canvas::new(width, height, ascii);
+        let targets = draw_disks(&mut canvas, &disks, area);
+        if let Some(target) = targets.first() {
+          canvas.highlight(target.rect);
+        }
+        let mut canvas = Canvas::new(width, height, ascii);
+        let (targets, _) = draw_folder(&mut canvas, &entries(300), 1 << 40, area, &HashSet::new());
+        if let Some(target) = targets.first() {
+          canvas.highlight(target.rect);
+        }
+      }
     }
   }
 }

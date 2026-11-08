@@ -1,9 +1,11 @@
 //! storage-analyzer: browse disks, partitions and folders as a proportional box map.
 
+mod actions;
 mod app;
 mod disks;
 mod layout;
 mod scan;
+mod smart;
 mod view;
 
 use app::App;
@@ -26,8 +28,9 @@ Without PATH the program starts on the map of all disks.
 
 Options:
       --summary      Scan PATH, print the totals and exit
-      --threads N    Number of scanning threads
-  -h, --help         Print this help
+      --health       Print the health of every disk and exit (needs root)
+      --ascii        Draw with # and . instead of colour fills
+      --threads N    Number of scanning and deleting threads-h, --help         Print this help
   -V, --version      Print the version";
 
 /// The parsed command line.
@@ -35,6 +38,8 @@ Options:
 struct Options {
   path: Option<PathBuf>,
   summary: bool,
+  health: bool,
+  ascii: bool,
   threads: Option<usize>,
   help: bool,
   version: bool,
@@ -47,6 +52,8 @@ fn parse_options(arguments: impl IntoIterator<Item = String>) -> Result<Options,
   while let Some(argument) = arguments.next() {
     match argument.as_str() {
       "--summary" => options.summary = true,
+      "--health" => options.health = true,
+      "--ascii" => options.ascii = true,
       "-h" | "--help" => options.help = true,
       "-V" | "--version" => options.version = true,
       "--threads" => {
@@ -87,20 +94,42 @@ fn print_summary(path: &Path, threads: Option<usize>) -> io::Result<()> {
   Ok(())
 }
 
+/// Print the health of every disk, one disk per line.
+fn print_health() -> Result<(), String> {
+  for disk in disks::read_disks().map_err(|error| format!("cannot read disks: {error}"))? {
+    let health = smart::read_health(&disk.name, &disk.model);
+    let fields: Vec<String> = smart::health_fields(&health)
+      .into_iter()
+      .map(|field| field.text)
+      .collect();
+    println!("{}  {}  {}", disk.name, disk.model, fields.join("  "));
+  }
+  Ok(())
+}
+
+/// Return whether this terminal cannot be trusted with 24-bit colour and block characters.
+fn terminal_needs_ascii() -> bool {
+  matches!(
+    std::env::var("TERM").as_deref(),
+    Ok("linux" | "dumb" | "vt100")
+  )
+}
+
 /// Run the interactive interface until the user quits.
 fn run_interface(options: &Options) -> Result<(), String> {
   if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
     return Err("the interface needs a terminal; use --summary PATH otherwise".to_string());
   }
+  let ascii = options.ascii || terminal_needs_ascii();
   let mut app = match &options.path {
-    Some(path) => App::on_folder(path, options.threads)
+    Some(path) => App::on_folder(path, options.threads, ascii)
       .map_err(|error| format!("{}: {error}", path.display()))?,
     None => {
       let disks = disks::read_disks().map_err(|error| format!("cannot read disks: {error}"))?;
       if disks.is_empty() {
         return Err("no physical disks found".to_string());
       }
-      App::on_disks(disks, options.threads)
+      App::on_disks(disks, options.threads, ascii)
     }
   };
   let mut terminal = ratatui::init();
@@ -119,6 +148,9 @@ fn run() -> Result<(), String> {
   if options.version {
     println!("storage-analyzer {}", env!("CARGO_PKG_VERSION"));
     return Ok(());
+  }
+  if options.health {
+    return print_health();
   }
   match (&options.path, options.summary) {
     (Some(path), true) => {

@@ -40,6 +40,8 @@ pub struct Item {
 pub struct Node {
   pub parent: u32,
   pub total: u64,
+  /// Something inside this directory lives on another filesystem and was not scanned.
+  pub foreign: bool,
   pub children: Vec<Item>,
 }
 
@@ -75,6 +77,7 @@ impl Tree {
     let root = Node {
       parent: ROOT,
       total: root_size,
+      foreign: false,
       children: Vec::new(),
     };
     Self {
@@ -110,16 +113,132 @@ impl Tree {
     self.files += batch.files;
     self.denied += batch.denied;
     self.other_filesystem += batch.other_filesystem;
+    self.nodes[parent as usize].foreign = batch.other_filesystem > 0;
     self.nodes[parent as usize].children = batch.items;
-    let mut current = parent;
+    self.grow_ancestors(parent, added);
+  }
+
+  /// Add bytes to a directory and to everything above it.
+  fn grow_ancestors(&mut self, start: u32, bytes: u64) {
+    let mut current = start;
     loop {
       let node = &mut self.nodes[current as usize];
-      node.total += added;
+      node.total += bytes;
       if current == ROOT {
         break;
       }
       current = node.parent;
     }
+  }
+
+  /// Take bytes from a directory and from everything above it.
+  fn shrink_ancestors(&mut self, start: u32, bytes: u64) {
+    let mut current = start;
+    loop {
+      let node = &mut self.nodes[current as usize];
+      node.total = node.total.saturating_sub(bytes);
+      if current == ROOT {
+        break;
+      }
+      current = node.parent;
+    }
+  }
+
+  /// Return a directory and every directory below it.
+  fn subtree(&self, start: u32) -> Vec<u32> {
+    let mut found = vec![start];
+    let mut next = 0;
+    while next < found.len() {
+      let children = &self.nodes[found[next] as usize].children;
+      found.extend(children.iter().filter_map(|item| match item.kind {
+        ItemKind::Dir(node) => Some(node),
+        _ => None,
+      }));
+      next += 1;
+    }
+    found
+  }
+
+  /// Return whether a directory has another filesystem somewhere below it.
+  pub fn contains_other_filesystem(&self, node: u32) -> bool {
+    self
+      .subtree(node)
+      .iter()
+      .any(|&node| self.nodes[node as usize].foreign)
+  }
+
+  /// Unlink a named child from its directory and take its size from the ancestors.
+  fn detach(&mut self, node: u32, name: &str) -> Option<(Item, u64)> {
+    let children = &mut self.nodes[node as usize].children;
+    let index = children
+      .iter()
+      .position(|item| &*item.name == name && !matches!(item.kind, ItemKind::Group(_)))?;
+    let item = children.swap_remove(index);
+    let size = self.item_size(&item);
+    self.shrink_ancestors(node, size);
+    Some((item, size))
+  }
+
+  /// Take a child out of the tree while it is being deleted, returning it and its size.
+  pub fn take_item(&mut self, node: u32, name: &str) -> Option<(Item, u64)> {
+    self.detach(node, name)
+  }
+
+  /// Put back a child whose deletion failed.
+  pub fn restore_item(&mut self, node: u32, item: Item, size: u64) {
+    self.nodes[node as usize].children.push(item);
+    self.grow_ancestors(node, size);
+  }
+
+  /// Drop the file and folder counts of a child that is gone from the disk.
+  pub fn forget_item(&mut self, item: &Item) {
+    let dropped = match item.kind {
+      ItemKind::Dir(child) => self.subtree(child),
+      _ => {
+        self.files = self.files.saturating_sub(1);
+        Vec::new()
+      }
+    };
+    for directory in dropped {
+      self.directories = self.directories.saturating_sub(1);
+      for child in &self.nodes[directory as usize].children {
+        self.files = self.files.saturating_sub(match child.kind {
+          ItemKind::File => 1,
+          ItemKind::Group(count) => count as u64,
+          ItemKind::Dir(_) => 0,
+        });
+      }
+    }
+  }
+
+  /// Record that a child moved to another directory.
+  pub fn move_item(&mut self, from: u32, to: u32, name: &str) {
+    let Some((item, size)) = self.detach(from, name) else {
+      return;
+    };
+    if let ItemKind::Dir(child) = item.kind {
+      self.nodes[child as usize].parent = to;
+    }
+    self.nodes[to as usize].children.push(item);
+    self.grow_ancestors(to, size);
+  }
+
+  /// Add a directory that was just created.
+  pub fn add_directory(&mut self, parent: u32, name: &str, size: u64) {
+    let node = self.nodes.len() as u32;
+    self.nodes.push(Node {
+      parent,
+      total: size,
+      foreign: false,
+      children: Vec::new(),
+    });
+    self.nodes[parent as usize].children.push(Item {
+      name: name.into(),
+      size,
+      kind: ItemKind::Dir(node),
+    });
+    self.directories += 1;
+    self.grow_ancestors(parent, size);
   }
 }
 
@@ -144,7 +263,7 @@ impl Context {
 }
 
 /// Return the bytes a file really occupies on the disk.
-fn disk_bytes(metadata: &Metadata) -> u64 {
+pub fn disk_bytes(metadata: &Metadata) -> u64 {
   metadata.blocks() * BLOCK_SIZE
 }
 
@@ -245,7 +364,7 @@ fn is_rotational(device: u64) -> bool {
 }
 
 /// Return the thread count for a device: one on a rotating disk, else 80% of the cores.
-fn default_threads(device: u64) -> usize {
+pub fn default_threads(device: u64) -> usize {
   if is_rotational(device) {
     return 1;
   }
@@ -417,6 +536,119 @@ mod tests {
     assert_eq!(one.tree.directories, many.tree.directories);
     assert_eq!(one.tree.files, 40);
     fs::remove_dir_all(&dir).unwrap();
+  }
+
+  /// Return a tree of root / a / b holding files, with sizes that are easy to add up.
+  fn sample_tree() -> Tree {
+    let file = |name: &str, size| Item {
+      name: name.into(),
+      size,
+      kind: ItemKind::File,
+    };
+    let folder = |name: &str, size, node| Item {
+      name: name.into(),
+      size,
+      kind: ItemKind::Dir(node),
+    };
+    let mut tree = Tree::new(1);
+    let root_items = vec![folder("a", 10, 1), folder("c", 10, 3), file("f", 100)];
+    tree.apply(Batch {
+      node: ROOT,
+      items: root_items,
+      files: 1,
+      ..Batch::default()
+    });
+    let a_items = vec![folder("b", 10, 2), file("g", 200)];
+    tree.apply(Batch {
+      node: 1,
+      items: a_items,
+      files: 1,
+      ..Batch::default()
+    });
+    tree.apply(Batch {
+      node: 2,
+      items: vec![file("h", 300)],
+      files: 1,
+      ..Batch::default()
+    });
+    tree.apply(Batch {
+      node: 3,
+      items: Vec::new(),
+      other_filesystem: 1,
+      ..Batch::default()
+    });
+    tree
+  }
+
+  #[test]
+  fn deleting_a_folder_updates_every_total() {
+    let mut tree = sample_tree();
+    assert_eq!(tree.nodes[ROOT as usize].total, 631);
+    assert_eq!((tree.files, tree.directories), (3, 4));
+    let (item, _) = tree.take_item(ROOT, "a").unwrap();
+    tree.forget_item(&item);
+    assert_eq!(tree.nodes[ROOT as usize].total, 111);
+    assert_eq!((tree.files, tree.directories), (1, 2));
+    assert_eq!(tree.nodes[ROOT as usize].children.len(), 2);
+  }
+
+  #[test]
+  fn deleting_a_file_below_the_root_updates_its_ancestors() {
+    let mut tree = sample_tree();
+    let (item, _) = tree.take_item(2, "h").unwrap();
+    tree.forget_item(&item);
+    assert_eq!(tree.nodes[2].total, 10);
+    assert_eq!(tree.nodes[1].total, 220);
+    assert_eq!(tree.nodes[ROOT as usize].total, 331);
+    assert_eq!(tree.files, 2);
+  }
+
+  #[test]
+  fn a_failed_deletion_restores_the_item_and_every_total() {
+    let mut tree = sample_tree();
+    let (item, size) = tree.take_item(ROOT, "a").unwrap();
+    assert_eq!(tree.nodes[ROOT as usize].total, 111);
+    tree.restore_item(ROOT, item, size);
+    assert_eq!(tree.nodes[ROOT as usize].total, 631);
+    assert_eq!((tree.files, tree.directories), (3, 4));
+  }
+
+  #[test]
+  fn moving_keeps_the_grand_total_and_shifts_the_size() {
+    let mut tree = sample_tree();
+    tree.move_item(ROOT, 1, "f");
+    assert_eq!(tree.nodes[ROOT as usize].total, 631);
+    assert_eq!(tree.nodes[1].total, 620);
+    tree.move_item(1, 3, "b");
+    assert_eq!(tree.nodes[1].total, 310);
+    assert_eq!(tree.nodes[3].total, 320);
+    assert_eq!(tree.nodes[2].parent, 3);
+    assert_eq!(tree.nodes[ROOT as usize].total, 631);
+  }
+
+  #[test]
+  fn other_filesystems_are_found_anywhere_below() {
+    let mut tree = sample_tree();
+    assert!(tree.contains_other_filesystem(ROOT));
+    assert!(tree.contains_other_filesystem(3));
+    assert!(!tree.contains_other_filesystem(1));
+    tree.add_directory(1, "new", 5);
+    assert_eq!(tree.nodes[1].total, 525);
+    assert_eq!(tree.nodes[ROOT as usize].total, 636);
+    assert_eq!(tree.directories, 5);
+  }
+
+  #[test]
+  fn merged_files_cannot_be_deleted_by_name() {
+    let mut tree = sample_tree();
+    let group = Item {
+      name: "".into(),
+      size: 7,
+      kind: ItemKind::Group(3),
+    };
+    tree.nodes[2].children.push(group);
+    assert!(tree.take_item(2, "").is_none());
+    assert_eq!(tree.nodes[2].children.len(), 2);
   }
 
   #[test]
