@@ -6,26 +6,13 @@ by usage. Open a partition and its folders become boxes sized by what they occup
 go deeper, and delete or move what you find. It is a single static binary with no runtime
 dependencies.
 
-The sample below is the `--ascii` drawing, because a code block cannot show colour.
+The screenshots are real runs; only the folder names are blurred.
 
-```text
-/home/user/storage-analyzer  347M          347M  8835 files  scanned in 0.0s
-┌────────────────────────────────────────────────────────┬──────────────────────────┬──────────┐
-│ target/  212M  61.2%                                   │ .docker-cargo/           │ (10 more)│
-│##################################......................│ 134M  38.5%              │ 0.1%     │
-│##################################......................│##########................│..........│
-│##################################......................│##########................│..........│
-│##################################......................│##########................│..........│
-│##################################......................│##########................│..........│
-│##################################......................│##########................│..........│
-│##################################......................│##########................│..........│
-│##################################......................│##########................│..........│
-│##################################......................│##########................│..........│
-│##################################......................│##########................├──────────┤
-│##################################......................│##########................│ out/     │
-└────────────────────────────────────────────────────────┴──────────────────────────┴──────────┘
-target/  212M  61.2%                        arrows/hjkl move  Enter open  Backspace back  q quit
-```
+![Disk map with the health of every disk](docs/disk_map.png)
+
+![Folders of a partition as a treemap](docs/folder_view.png)
+
+![Marked folders and the delete prompt](docs/marked_and_delete.png)
 
 ## How it reads
 
@@ -135,11 +122,16 @@ gdu 5.36.1, on a tree of 21.3 million files and 4.8 million folders:
 
 ## Installation
 
-Build the binary as described below and link it into a directory on your `PATH`:
+Download the static Linux x86_64 binary from the latest release:
 
 ```bash
-ln -s "$PWD/out/storage-analyzer" ~/bin/storage-analyzer
+curl -L -o storage-analyzer https://github.com/stulluk/storage-analyzer/releases/latest/download/storage-analyzer-x86_64-linux-musl
+chmod +x storage-analyzer
 ```
+
+Every push to `main` is tested and rebuilds the release of the version in `Cargo.toml`.
+
+To build it yourself, see [Contributing](#contributing).
 
 ## Usage
 
